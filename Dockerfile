@@ -31,12 +31,15 @@ COPY . .
 
 RUN npx prisma generate && npm run build
 
-# Runtime CMD still runs `npx prisma db push` and starts the server with tsx.
-# Ignore lifecycle scripts here so the pruned patch-package postinstall
-# cannot fail the image build.
+# Runtime still runs Prisma 5 `db push` and starts the server with tsx.
+# Both CLIs are devDependencies, so prune removes them. Installing them
+# while they remain in devDependencies is a no-op under NODE_ENV=production,
+# and `npx prisma` would then download Prisma 8, which cannot push this schema.
 RUN npm prune --omit=dev \
-  && npm install --no-save --ignore-scripts --legacy-peer-deps prisma@5.22.0 tsx@4.21.0 typescript@5.9.3 \
-  && npx prisma generate
+  && npm pkg delete scripts.postinstall \
+  && npm pkg delete devDependencies \
+  && NODE_ENV=production npm install --no-save --legacy-peer-deps prisma@5.22.0 tsx@4.21.0 typescript@5.9.3 \
+  && ./node_modules/.bin/prisma generate
 
 FROM node:22-bookworm-slim AS runner
 
@@ -63,4 +66,4 @@ ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma db push && (if [ -n \"$ADMIN_EMAIL\" ] && [ -n \"$ADMIN_PASSWORD\" ]; then node scripts/setup-admin.js \"$ADMIN_EMAIL\" \"$ADMIN_PASSWORD\"; fi) && node node_modules/tsx/dist/cli.mjs src/server/index.ts"]
+CMD ["sh", "-c", "./node_modules/.bin/prisma db push && (if [ -n \"$ADMIN_EMAIL\" ] && [ -n \"$ADMIN_PASSWORD\" ]; then node scripts/setup-admin.js \"$ADMIN_EMAIL\" \"$ADMIN_PASSWORD\"; fi) && node node_modules/tsx/dist/cli.mjs src/server/index.ts"]
