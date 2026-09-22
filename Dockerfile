@@ -1,38 +1,66 @@
-FROM node:26-alpine AS builder
-RUN apk add --no-cache openssl ca-certificates
+# Node 22 LTS on Debian slim.
+# Zeabur injects service env into the image build. NODE_ENV=production makes
+# `npm ci` skip devDependencies, then the root postinstall (`patch-package`)
+# exits 127 because that binary was never installed. node:26-alpine also has
+# no git(1), and libsignal is a GitHub dependency.
+FROM node:22-bookworm-slim AS builder
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/* \
+  && git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+  && git config --global url."https://github.com/".insteadOf "git@github.com:"
+
 WORKDIR /app
 
-# Dependency layer — cache-friendly: only rerun when package*.json changes
-COPY package*.json ./
+# Build-only. Not copied into the runner image, so it cannot override the
+# DATABASE_URL Zeabur injects at runtime. mysql.zeabur.internal is not
+# reachable while the image is building; Prisma only needs a syntactically
+# valid URL in order to generate the client.
+ENV DATABASE_URL="mysql://build:build@127.0.0.1:3306/wa_akg_build"
+
+COPY package.json package-lock.json ./
 COPY patches ./patches/
 COPY prisma ./prisma/
-RUN npm ci --legacy-peer-deps && npm cache clean --force
 
-# Source & build
+# --include=dev wins even when Zeabur has injected NODE_ENV=production.
+RUN NODE_ENV=development npm ci --legacy-peer-deps --include=dev \
+  && npm cache clean --force
+
 COPY . .
+
 RUN npx prisma generate && npm run build
 
-# Strip devDeps from node_modules after build
-# tsx needed at runtime, kept explicitly
-RUN npm prune --omit=dev && npm install --no-save tsx typescript
+# Runtime CMD still runs `npx prisma db push` and starts the server with tsx.
+# Ignore lifecycle scripts here so the pruned patch-package postinstall
+# cannot fail the image build.
+RUN npm prune --omit=dev \
+  && npm install --no-save --ignore-scripts --legacy-peer-deps prisma@5.22.0 tsx@4.21.0 typescript@5.9.3 \
+  && npx prisma generate
 
-# Production image
-FROM node:26-alpine AS runner
-RUN apk add --no-cache openssl ca-certificates
+FROM node:22-bookworm-slim AS runner
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/package.json /app/package-lock.json ./
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/.next ./.next
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/tsconfig.json ./
+COPY --from=builder /app/next.config.ts ./
 COPY --from=builder /app/scripts ./scripts
 
+# Do not set DATABASE_URL in this stage. Zeabur injects the real service
+# value into the final stage; a placeholder here would shadow it.
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOSTNAME=0.0.0.0
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma db push && (if [ -n \"$ADMIN_EMAIL\"] && [ -n \"$ADMIN_PASSWORD\"]; then node scripts/setup-admin.js \"$ADMIN_EMAIL\" \"$ADMIN_PASSWORD\"; fi) && node node_modules/tsx/dist/cli.mjs src/server/index.ts"]
+CMD ["sh", "-c", "npx prisma db push && (if [ -n \"$ADMIN_EMAIL\" ] && [ -n \"$ADMIN_PASSWORD\" ]; then node scripts/setup-admin.js \"$ADMIN_EMAIL\" \"$ADMIN_PASSWORD\"; fi) && node node_modules/tsx/dist/cli.mjs src/server/index.ts"]
